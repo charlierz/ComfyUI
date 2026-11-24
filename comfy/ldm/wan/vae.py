@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from comfy.ldm.modules.diffusionmodules.model import vae_attention, torch_cat_if_needed
+from comfy.ldm.modules.diffusionmodules.model import vae_attention
+from comfy.ldm.wan import vae_kernels
 
 import comfy.ops
 ops = comfy.ops.disable_weight_init
@@ -31,20 +32,52 @@ class CausalConv3d(ops.Conv3d):
         if cache_x is None and x.shape[2] == 1:
             #Fast path - the op will pad for use by truncating the weight
             #and save math on a pile of zeros.
-            return super().forward(x, autopad="causal_zero")
+            return super().forward(_channels_last(x), autopad="causal_zero")
 
         if self._padding > 0:
-            padding_needed = self._padding
-            if cache_x is not None:
-                cache_x = cache_x.to(x.device)
-                padding_needed = max(0, padding_needed - cache_x.shape[2])
-            padding_shape = list(x.shape)
-            padding_shape[2] = padding_needed
-            padding = torch.zeros(padding_shape, device=x.device, dtype=x.dtype)
-            x = torch_cat_if_needed([padding, cache_x, x], dim=2)
+            buf, start = self._causal_buffer(x, cache_x)
+            buf[:, :, start:].copy_(x)
             del cache_x
+            x = buf
+        else:
+            x = _channels_last(x)
 
         return super().forward(x)
+
+    def _causal_buffer(self, x, cache):
+        # Assemble [zeros, cache, x] in NHWC so cuDNN doesn't need an input-sized layout workspace.
+        b, c, t, h, w = x.shape
+        ct = 0 if cache is None else cache.shape[2]
+        zeros = max(0, self._padding - ct)
+        fmt = torch.channels_last_3d if x.is_cuda and torch.version.cuda is not None else torch.contiguous_format
+        buf = torch.empty((b, c, zeros + ct + t, h, w), device=x.device, dtype=x.dtype, memory_format=fmt)
+        if zeros:
+            buf[:, :, :zeros].zero_()
+        if ct:
+            buf[:, :, zeros:zeros + ct].copy_(cache)
+        return buf, zeros + ct
+
+    def forward_normed(self, x, norm, cache_list, idx):
+        cache = cache_list[idx]
+        cache_list[idx] = None
+        if cache is None and x.shape[2] == 1:
+            xn = torch.empty_like(x, memory_format=torch.channels_last_3d)
+            vae_kernels.rms_silu(x, norm.gamma, norm.scale, xn)
+            cache_list[idx] = xn
+            return super().forward(xn, autopad="causal_zero")
+
+        buf, start = self._causal_buffer(x, cache)
+        del cache
+        vae_kernels.rms_silu(x, norm.gamma, norm.scale, buf[:, :, start:])
+        # Retain just the normalized input history, not a view of the conv buffer.
+        cache_list[idx] = buf[:, :, -CACHE_T:].clone(memory_format=torch.channels_last_3d)
+        return super().forward(buf)
+
+
+def _channels_last(x):
+    if x.is_cuda and torch.version.cuda is not None:
+        return x.contiguous(memory_format=torch.channels_last_3d)
+    return x
 
 
 class RMS_norm(nn.Module):
@@ -148,7 +181,7 @@ class Resample(nn.Module):
                         x = None
 
                 feat_idx[0] += 2
-        return x
+        return None if x is None else _channels_last(x)
 
 
 class ResidualBlock(nn.Module):
@@ -168,6 +201,13 @@ class ResidualBlock(nn.Module):
             if in_dim != out_dim else nn.Identity()
 
     def forward(self, x, feat_cache=None, feat_idx=[0], final=False):
+        if feat_cache is not None and not self.training and vae_kernels.available(x):
+            norm1, _, conv1, norm2, _, _, conv2 = self.residual
+            h = conv1.forward_normed(x, norm1, feat_cache, feat_idx[0])
+            h = conv2.forward_normed(_channels_last(h), norm2, feat_cache, feat_idx[0] + 1)
+            feat_idx[0] += 2
+            h += self.shortcut(x)
+            return h
         old_x = x
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
