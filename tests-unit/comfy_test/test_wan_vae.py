@@ -19,6 +19,11 @@ def init_convs(model):
     return model.eval()
 
 
+@pytest.fixture
+def wan_vae():
+    return init_convs(vae.WanVAE(dim=4, z_dim=2, num_res_blocks=1))
+
+
 def stock_conv(layer, x, cache_x=None, cache_list=None, cache_idx=None):
     if cache_list is not None:
         cache_x = cache_list[cache_idx]
@@ -54,7 +59,7 @@ def test_fused_residual_matches_unfused(dtype, monkeypatch):
     def run():
         cache = [None, None]
         return torch.cat(
-            [block(chunk, cache, [0]) for chunk in x.split((1, 2, 2), dim=2)], dim=2
+            [block(chunk, cache, [0]) for chunk in x.split((1, 2, 1, 1), dim=2)], dim=2
         )
 
     rms_silu = vae_kernels.rms_silu
@@ -66,8 +71,34 @@ def test_fused_residual_matches_unfused(dtype, monkeypatch):
 
     monkeypatch.setattr(vae_kernels, "rms_silu", record_fusion)
     fused = run()
-    assert calls == [1, 1, 2, 2, 2, 2]
+    assert calls == [1, 1, 2, 2, 1, 1, 1, 1]
     monkeypatch.setattr(vae_kernels, "triton", None)
     unfused = run()
     atol, rtol = (0.002, 0.004) if dtype == torch.float16 else (0.018, 0.025)
     torch.testing.assert_close(fused, unfused, atol=atol, rtol=rtol)
+
+
+@torch.no_grad()
+def test_single_frame_matches_stock_convolutions(wan_vae, monkeypatch):
+    x = torch.randn(2, 3, 1, 24, 32)
+    z = wan_vae.encode(x)
+    decoded = wan_vae.decode(z)
+    assert z.shape == (2, 2, 1, 3, 4)
+    assert decoded.shape == x.shape
+
+    monkeypatch.setattr(vae.CausalConv3d, "forward", stock_conv)
+    torch.testing.assert_close(z, wan_vae.encode(x))
+    torch.testing.assert_close(decoded, wan_vae.decode(z))
+
+
+@pytest.mark.parametrize("latent_frames", [3, 4])
+@torch.no_grad()
+def test_one_frame_decode_matches_two_frame_schedule(
+    wan_vae, latent_frames, monkeypatch
+):
+    z = torch.randn(1, 2, latent_frames, 3, 4)
+    out = wan_vae.decode(z)
+    assert out.shape == (1, 3, 1 + 4 * (latent_frames - 1), 24, 32)
+
+    monkeypatch.setattr(wan_vae.decoder, "last_upsample3d", -1)
+    torch.testing.assert_close(out, wan_vae.decode(z), atol=2e-6, rtol=1e-5)

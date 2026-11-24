@@ -74,6 +74,13 @@ class CausalConv3d(ops.Conv3d):
         return super().forward(buf)
 
 
+def _next_cache(x, old):
+    t = x.shape[2]
+    if t >= CACHE_T or old is None:
+        return x[:, :, -CACHE_T:]
+    return torch.cat((old[:, :, t - CACHE_T:], x), dim=2)
+
+
 def _channels_last(x):
     if x.is_cuda and torch.version.cuda is not None:
         return x.contiguous(memory_format=torch.channels_last_3d)
@@ -156,7 +163,11 @@ class Resample(nn.Module):
                     x = x.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
-        x = self.resample(x)
+        if t > 1 and self.mode.startswith('upsample'):
+            # Keep only one nearest-upsampled frame live at a time.
+            x = torch.cat([self.resample(x[i:i + 1]) for i in range(x.shape[0])])
+        else:
+            x = self.resample(x)
         x = rearrange(x, '(b t) c h w -> b c t h w', t=t)
 
         if self.mode == 'downsample3d':
@@ -212,7 +223,7 @@ class ResidualBlock(nn.Module):
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :]
+                cache_x = _next_cache(x, feat_cache[idx])
                 x = layer(x, cache_list=feat_cache, cache_idx=idx)
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
@@ -394,6 +405,7 @@ class Decoder3d(nn.Module):
                 upsamples.append(Resample(out_dim, mode=mode))
                 scale *= 2.0
         self.upsamples = nn.Sequential(*upsamples)
+        self.last_upsample3d = max((i for i, layer in enumerate(upsamples) if isinstance(layer, Resample) and layer.mode == 'upsample3d'), default=-1)
 
         # output blocks
         self.head = nn.Sequential(
@@ -406,7 +418,7 @@ class Decoder3d(nn.Module):
         if layer_idx >= len(self.upsamples):
             for layer in self.head:
                 if isinstance(layer, CausalConv3d) and feat_cache is not None:
-                    cache_x = x[:, :, -CACHE_T:, :, :]
+                    cache_x = _next_cache(x, feat_cache[feat_idx[0]])
                     x = layer(x, feat_cache[feat_idx[0]])
                     feat_cache[feat_idx[0]] = cache_x
                     feat_idx[0] += 1
@@ -421,11 +433,13 @@ class Decoder3d(nn.Module):
         else:
             x = layer(x)
 
-        if isinstance(layer, Resample) and layer.mode == 'upsample3d' and x.shape[2] > 2:
-            for frame_idx in range(0, x.shape[2], 2):
+        # At the last temporal upsample, the two-frame cache lets us process one frame at a time.
+        step = 1 if layer_idx == self.last_upsample3d else 2
+        if isinstance(layer, Resample) and layer.mode == 'upsample3d' and x.shape[2] > step:
+            for frame_idx in range(0, x.shape[2], step):
                 self.run_up(
                     layer_idx + 1,
-                    [x[:, :, frame_idx:frame_idx + 2, :, :]],
+                    [x[:, :, frame_idx:frame_idx + step, :, :]],
                     feat_cache,
                     feat_idx.copy(),
                     out_chunks,
