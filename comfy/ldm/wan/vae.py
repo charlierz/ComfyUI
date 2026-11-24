@@ -55,36 +55,32 @@ class CausalConv3d(ops.Conv3d):
 
         return super().forward(x)
 
-
-def _forward_normed(self, x, norm, cache_list, idx, residual=None):
-    # silu(norm(x)) written by one kernel into the [zeros, cache, x] conv buffer; the cache keeps the
-    # buffer's last CACHE_T frames (the normalized input), as the unfused path caches silu(norm(x)).
-    cache = cache_list[idx]
-    cache_list[idx] = None
-    b, c, t, h, w = x.shape
-    if cache is None and t == 1:
-        xn = vae_kernels.rms_silu(x, norm.gamma, norm.scale, torch.empty_like(x, memory_format=torch.channels_last_3d))
-        cache_list[idx] = xn
-        out = ops.Conv3d.forward(self, xn, autopad="causal_zero")
-    else:
-        ct = 0 if cache is None else cache.shape[2]
-        zeros = max(0, self._padding - ct)
-        buf = torch.empty((b, c, zeros + ct + t, h, w), device=x.device, dtype=x.dtype, memory_format=torch.channels_last_3d)
-        if zeros:
-            buf[:, :, :zeros].zero_()
-        if ct:
-            buf[:, :, zeros:zeros + ct].copy_(cache)
-        del cache
-        vae_kernels.rms_silu(x, norm.gamma, norm.scale, buf[:, :, zeros + ct:])
-        cache_list[idx] = buf[:, :, -CACHE_T:].clone(memory_format=torch.channels_last_3d)
-        out = ops.Conv3d.forward(self, buf)
-        del buf
-    if residual is not None:
-        out += residual
-    return out
-
-
-CausalConv3d.forward_normed = _forward_normed
+    def forward_normed(self, x, norm, cache_list, idx, residual=None):
+        # silu(norm(x)) written by one kernel into the [zeros, cache, x] conv buffer; the cache keeps the
+        # buffer's last CACHE_T frames (the normalized input), as the unfused path caches silu(norm(x)).
+        cache = cache_list[idx]
+        cache_list[idx] = None
+        b, c, t, h, w = x.shape
+        if cache is None and t == 1:
+            xn = vae_kernels.rms_silu(x, norm.gamma, norm.scale, torch.empty_like(x, memory_format=torch.channels_last_3d))
+            cache_list[idx] = xn
+            out = super().forward(xn, autopad="causal_zero")
+        else:
+            ct = 0 if cache is None else cache.shape[2]
+            zeros = max(0, self._padding - ct)
+            buf = torch.empty((b, c, zeros + ct + t, h, w), device=x.device, dtype=x.dtype, memory_format=torch.channels_last_3d)
+            if zeros:
+                buf[:, :, :zeros].zero_()
+            if ct:
+                buf[:, :, zeros:zeros + ct].copy_(cache)
+            del cache
+            vae_kernels.rms_silu(x, norm.gamma, norm.scale, buf[:, :, zeros + ct:])
+            cache_list[idx] = buf[:, :, -CACHE_T:].clone(memory_format=torch.channels_last_3d)
+            out = super().forward(buf)
+            del buf
+        if residual is not None:
+            out += residual
+        return out
 
 
 def _next_cache(x, old):
@@ -447,7 +443,7 @@ class Decoder3d(nn.Module):
 
         # Full-resolution layers take one frame per call (their caches carry the two-frame history), which
         # halves the decoder's working set at the top resolution; earlier stages keep two-frame chunks.
-        step = int(__import__("os").environ.get("WAN_TOP_STEP", "1")) if layer_idx == self.last_upsample3d else 2
+        step = 1 if layer_idx == self.last_upsample3d else 2
         if isinstance(layer, Resample) and layer.mode == 'upsample3d' and x.shape[2] > step:
             for frame_idx in range(0, x.shape[2], step):
                 self.run_up(
