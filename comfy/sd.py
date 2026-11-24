@@ -888,8 +888,24 @@ class VAE:
                     ddconfig = {"dim": dim, "z_dim": self.latent_channels, "dim_mult": [1, 2, 4, 4], "num_res_blocks": 2, "attn_scales": [], "temperal_downsample": [False, True, True], "image_channels": self.output_channels, "conv_out_channels": self.conv_out_channels, "dropout": 0.0}
                     self.first_stage_model = comfy.ldm.wan.vae.WanVAE(**ddconfig)
                     self.working_dtypes = [torch.bfloat16, torch.float16, torch.float32]
-                    self.memory_used_encode = lambda shape, dtype: (1500 if shape[2]<=4 else 6000) * shape[3] * shape[4] * model_management.dtype_size(dtype)
-                    self.memory_used_decode = lambda shape, dtype: (2200 if shape[2]<=4 else 7000) * shape[3] * shape[4] * (8*8) * model_management.dtype_size(dtype)
+                    # Chunked CPU I/O on RTX 4080 (bf16, batch 1) peaks at about 2.8/3.8 GiB
+                    # encode/decode for 768² video and 8/11 GiB for 1312² video.
+                    def wan_bf16_cuda(dtype):
+                        return self.device.type == "cuda" and torch.version.cuda is not None and dtype == torch.bfloat16
+
+                    def wan_encode_memory(shape, dtype):
+                        factor = 1500 if shape[2] <= 4 else (2700 if wan_bf16_cuda(dtype) else 6000)
+                        return factor * shape[3] * shape[4] * model_management.dtype_size(dtype)
+
+                    def wan_decode_memory(shape, dtype):
+                        if wan_bf16_cuda(dtype) and self.output_device.type == "cpu":
+                            factor = 2200 if shape[2] == 1 else 3600
+                        else:
+                            factor = 2200 if shape[2] <= 4 else 7000
+                        return factor * shape[3] * shape[4] * (8*8) * model_management.dtype_size(dtype)
+
+                    self.memory_used_encode = wan_encode_memory
+                    self.memory_used_decode = wan_decode_memory
 
 
             # Hunyuan 3d v2 2.0 & 2.1

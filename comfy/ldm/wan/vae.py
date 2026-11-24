@@ -484,6 +484,7 @@ def count_cache_layers(model):
 
 
 class WanVAE(nn.Module):
+    comfy_has_chunked_io = True
 
     def __init__(self,
                  dim=128,
@@ -512,8 +513,7 @@ class WanVAE(nn.Module):
         self.decoder = Decoder3d(dim, z_dim, conv_out_channels, dim_mult, num_res_blocks,
                                  attn_scales, self.temperal_upsample, dropout)
 
-    def encode(self, x):
-        conv_idx = [0]
+    def encode(self, x, device=None):
         ## cache
         t = x.shape[2]
         t = 1 + ((t - 1) // 4) * 4
@@ -526,12 +526,12 @@ class WanVAE(nn.Module):
             conv_idx = [0]
             if i == 0:
                 out = self.encoder(
-                    x[:, :, :1, :, :],
+                    x[:, :, :1, :, :].to(device=device),
                     feat_cache=feat_map,
                     feat_idx=conv_idx)
             else:
                 out_ = self.encoder(
-                    x[:, :, 1 + 2 * (i - 1):1 + 2 * i, :, :],
+                    x[:, :, 1 + 2 * (i - 1):1 + 2 * i, :, :].to(device=device),
                     feat_cache=feat_map,
                     feat_idx=conv_idx,
                     final=(i == (iter_ - 1)))
@@ -542,24 +542,37 @@ class WanVAE(nn.Module):
         mu, log_var = self.conv1(out).chunk(2, dim=1)
         return mu
 
-    def decode(self, z):
-        # z: [b,c,t,h,w]
+    def decode_output_shape(self, shape):
+        b, _, t, h, w = shape
+        stages = len(self.dim_mult) - 1
+        spatial = 2 ** stages
+        temporal = 2 ** sum(self.temperal_upsample[:stages])
+        return (b, self.decoder.head[-1].out_channels, 1 + temporal * (t - 1), h * spatial, w * spatial)
+
+    def decode(self, z, output_buffer=None):
+        if output_buffer is not None:
+            # Stream one video's chunks at a time into the caller's buffer, which can be on CPU.
+            for i in range(z.shape[0]):
+                pos = 0
+                for out in self._decode_chunks(z[i:i + 1]):
+                    output_buffer[i:i + 1, :, pos:pos + out.shape[2]].copy_(out)
+                    pos += out.shape[2]
+                    del out
+            return output_buffer
+
+        full, pos = None, 0
+        for out in self._decode_chunks(z):
+            if full is None:
+                full = out.new_empty(self.decode_output_shape(z.shape))
+            full[:, :, pos:pos + out.shape[2]].copy_(out)
+            pos += out.shape[2]
+            del out
+        return full
+
+    def _decode_chunks(self, z):
         iter_ = 1 + z.shape[2] // 2
-        feat_map = None
-        if iter_ > 1:
-            feat_map = [None] * count_cache_layers(self.decoder)
+        feat_map = [None] * count_cache_layers(self.decoder) if iter_ > 1 else None
         x = self.conv2(z)
         for i in range(iter_):
-            conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx)
-            else:
-                out_ = self.decoder(
-                    x[:, :, 1 + 2 * (i - 1):1 + 2 * i, :, :],
-                    feat_cache=feat_map,
-                    feat_idx=conv_idx)
-                out += out_
-        return torch.cat(out, 2)
+            chunk = x[:, :, :1] if i == 0 else x[:, :, 2 * i - 1:2 * i + 1]
+            yield from self.decoder(chunk, feat_cache=feat_map, feat_idx=[0])

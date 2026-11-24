@@ -102,3 +102,38 @@ def test_one_frame_decode_matches_two_frame_schedule(
 
     monkeypatch.setattr(wan_vae.decoder, "last_upsample3d", -1)
     torch.testing.assert_close(out, wan_vae.decode(z), atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("latent_frames", [1, 4])
+@torch.no_grad()
+def test_decode_into_cpu_buffer_matches_full_decode(wan_vae, device, latent_frames):
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    wan_vae.to(device=device, dtype=dtype)
+    z = torch.randn(2, 2, latent_frames, 3, 4, device=device, dtype=dtype)
+    out = torch.full(wan_vae.decode_output_shape(z.shape), float("nan"), device="cpu")
+    assert wan_vae.decode(z, output_buffer=out) is out
+    expected = torch.cat([wan_vae.decode(sample) for sample in z.split(1)])
+    torch.testing.assert_close(out, expected.cpu().float())
+
+
+@pytest.mark.parametrize("frames", [1, 9])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.no_grad()
+def test_encode_cpu_input_matches_device_input(wan_vae, frames):
+    wan_vae.to(device="cuda", dtype=torch.float16)
+    x = torch.randn(1, frames, 24, 32, 3, dtype=torch.float16).permute(0, 4, 1, 2, 3)
+    expected = wan_vae.encode(x.cuda())
+    out = wan_vae.encode(x, device="cuda")
+    torch.testing.assert_close(out, expected)
